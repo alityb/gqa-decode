@@ -26,6 +26,10 @@ def test_reference_matches_kernel(num_q_heads: int, num_kv_heads: int, head_dim:
     k = torch.randn(num_kv_heads, seq_len, head_dim, device="cuda", dtype=dtype)
     v = torch.randn(num_kv_heads, seq_len, head_dim, device="cuda", dtype=dtype)
     ref = reference_gqa_decode(q, k, v, num_kv_heads=num_kv_heads)
-    out = gqa_decode_attention(q, k, v, backend="auto")
+    out = gqa_decode_attention(q, k, v, backend="cute")
     max_err = (out.float() - ref.float()).abs().max().item()
     assert max_err < 1e-2
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

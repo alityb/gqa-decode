@@ -1,65 +1,84 @@
 from __future__ import annotations
 
-import argparse
-
 import torch
 
 from gqa_decode import gqa_decode_attention
 
 
-CONFIGS = [
-    ("Llama3-8B", 32, 8, 128),
-    ("Llama3-70B", 64, 8, 128),
-    ("Qwen2.5-7B", 28, 4, 128),
-    ("MHA", 32, 32, 128),
-]
-SEQ_LENS = [1024, 4096, 16384, 32768, 65536]
+HBM_PEAK_BW = 3.35e12
 
 
-def time_fn(fn, q, k, v, warmup, iters):
+def bench(fn, warmup=20, iters=200):
     for _ in range(warmup):
-        fn(q, k, v)
+        fn()
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        fn(q, k, v)
+        fn()
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters * 1000
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=200)
-    args = parser.parse_args()
-
+def run_comparison():
     try:
         import flashinfer
-    except ImportError as exc:
-        raise SystemExit("flashinfer is not installed") from exc
 
-    dtype = getattr(torch, args.dtype)
-    for name, num_q_heads, num_kv_heads, head_dim in CONFIGS:
-        print(name)
-        for seq_len in SEQ_LENS:
-            q = torch.randn(num_q_heads, head_dim, device="cuda", dtype=dtype)
-            k = torch.randn(num_kv_heads, seq_len, head_dim, device="cuda", dtype=dtype)
-            v = torch.randn(num_kv_heads, seq_len, head_dim, device="cuda", dtype=dtype)
-            ours = time_fn(gqa_decode_attention, q, k, v, args.warmup, args.iters)
-            ref = time_fn(
-                lambda q_, k_, v_: flashinfer.single_decode_with_kv_cache(q_, k_, v_),
-                q,
-                k,
-                v,
-                args.warmup,
-                args.iters,
+        has_fi = True
+    except ImportError:
+        print("FlashInfer not installed — skipping comparison")
+        has_fi = False
+
+    configs = [
+        ("Llama3-8B", 32, 8, 128),
+        ("Llama3-70B", 64, 8, 128),
+        ("Qwen2.5-7B", 28, 4, 128),
+        ("MHA", 32, 32, 128),
+    ]
+    seq_lens = [4096, 16384, 32768, 65536]
+
+    print(
+        f"{'Config':<14} {'SeqLen':>7} {'Ours(us)':>9} {'FI(us)':>9} "
+        f"{'Ours BW%':>9} {'FI BW%':>9} {'Speedup':>8}"
+    )
+    print("-" * 75)
+
+    for name, nq, nkv, d in configs:
+        for seq in seq_lens:
+            q_ours = torch.randn(nq, d, device="cuda", dtype=torch.bfloat16)
+            k_ours = torch.randn(nkv, seq, d, device="cuda", dtype=torch.bfloat16)
+            v_ours = torch.randn(nkv, seq, d, device="cuda", dtype=torch.bfloat16)
+
+            ours_us = bench(lambda: gqa_decode_attention(q_ours, k_ours, v_ours, backend="cute"))
+            kv_bytes = 2 * nkv * seq * d * q_ours.element_size()
+            ours_bw = kv_bytes / (ours_us / 1e6) / HBM_PEAK_BW * 100
+
+            if has_fi:
+                q_fi = torch.randn(nq, d, device="cuda", dtype=torch.float16)
+                k_fi = torch.randn(seq, nkv, d, device="cuda", dtype=torch.float16)
+                v_fi = torch.randn(seq, nkv, d, device="cuda", dtype=torch.float16)
+                try:
+                    fi_us = bench(lambda: flashinfer.single_decode_with_kv_cache(q_fi, k_fi, v_fi))
+                    kv_bytes_fi = 2 * nkv * seq * d * q_fi.element_size()
+                    fi_bw = kv_bytes_fi / (fi_us / 1e6) / HBM_PEAK_BW * 100
+                    speedup = fi_us / ours_us
+                except Exception:
+                    fi_us = float("nan")
+                    fi_bw = float("nan")
+                    speedup = float("nan")
+            else:
+                fi_us = float("nan")
+                fi_bw = float("nan")
+                speedup = float("nan")
+
+            print(
+                f"{name:<14} {seq:>7} {ours_us:>8.1f} {fi_us:>8.1f} "
+                f"{ours_bw:>8.1f}% {fi_bw:>8.1f}% {speedup:>7.2f}x"
             )
-            print(f"  seq={seq_len:>6}  ours={ours:>8.1f}us  flashinfer={ref:>8.1f}us")
+        print()
 
 
 if __name__ == "__main__":
-    main()
+    run_comparison()

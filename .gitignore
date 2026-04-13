@@ -8,3 +8,5 @@ __pycache__/
 *.egg-info/
 quack/
 flash-attention/
+flashinfer/
+tmp_cute_copy_test.py

@@ -11,6 +11,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
+from quack import copy_utils
+
 from gqa_decode.cute_dsl_utils import make_fake_tensor, torch2cute_dtype_map
 
 
@@ -41,7 +43,7 @@ def reference_gqa_decode(
     if k_cache.shape != v_cache.shape:
         raise ValueError("k_cache and v_cache must have identical shapes")
     num_q_heads, head_dim = q.shape
-    kv_heads, seq_len, kv_head_dim = k_cache.shape
+    kv_heads, _, kv_head_dim = k_cache.shape
     if kv_head_dim != head_dim:
         raise ValueError("Q/K/V head_dim mismatch")
     if num_kv_heads is None:
@@ -75,26 +77,8 @@ def select_num_splits(
     return min(min_splits, max_tiles)
 
 
-def _reduce_partial_results(
-    partial_out: torch.Tensor,
-    partial_max: torch.Tensor,
-    partial_sum: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    max_per_head = partial_max.max(dim=0).values
-    safe_max = torch.where(torch.isfinite(max_per_head), max_per_head, torch.zeros_like(max_per_head))
-    rescale = torch.exp2((partial_max - safe_max.unsqueeze(0)) * LOG2_E)
-    denom = (partial_sum * rescale).sum(dim=0)
-    numer = (partial_out * rescale[:, :, None]).sum(dim=0)
-    out = numer / denom.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1)
-    zero_mask = denom == 0
-    if zero_mask.any():
-        out[zero_mask] = 0
-    return out.to(out_dtype)
-
-
-class DecodePartialKernel:
-    def __init__(self, dtype, head_dim: int, group_size: int, block_seq: int, smem_pad: int):
+class DirectDecodeKernel:
+    def __init__(self, dtype, head_dim: int, group_size: int, block_seq: int):
         if head_dim not in (64, 128):
             raise ValueError(f"Unsupported head_dim={head_dim}; expected 64 or 128")
         if head_dim % cute.arch.WARP_SIZE != 0:
@@ -105,8 +89,7 @@ class DecodePartialKernel:
         self.head_dim = head_dim
         self.group_size = group_size
         self.block_seq = block_seq
-        self.smem_pad = smem_pad
-        self.frag_elems = head_dim // cute.arch.WARP_SIZE
+        self.vec = head_dim // cute.arch.WARP_SIZE
         self.scale = float(head_dim**-0.5)
 
     @cute.jit
@@ -115,20 +98,13 @@ class DecodePartialKernel:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
-        mPartialO: cute.Tensor,
-        mPartialMax: cute.Tensor,
-        mPartialSum: cute.Tensor,
+        mO: cute.Tensor,
         stream=None,
     ):
-        assert mQ.element_type == self.dtype
-        assert mK.element_type == self.dtype
-        assert mV.element_type == self.dtype
-        assert mPartialO.element_type == Float32
-        assert mPartialMax.element_type == Float32
-        assert mPartialSum.element_type == Float32
-        self.kernel(mQ, mK, mV, mPartialO, mPartialMax, mPartialSum).launch(
-            grid=[mK.shape[0], mPartialO.shape[0], 1],
-            block=[cute.arch.WARP_SIZE, 1, 1],
+        tiled_in = copy_utils.tiled_copy_2d(self.dtype, 32, 32, self.vec)
+        self.kernel(mQ, mK, mV, mO, tiled_in).launch(
+            grid=[mK.shape[0], 1, 1],
+            block=[32, 1, 1],
             stream=stream,
         )
 
@@ -138,111 +114,108 @@ class DecodePartialKernel:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
-        mPartialO: cute.Tensor,
-        mPartialMax: cute.Tensor,
-        mPartialSum: cute.Tensor,
+        mO: cute.Tensor,
+        tiled_in: cute.TiledCopy,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        kv_head, split_idx, _ = cute.arch.block_idx()
-        frag_base = tidx * self.frag_elems
-        seq_len = mK.shape[1]
-        num_splits = mPartialO.shape[0]
-        split_stride = num_splits * self.block_seq
-        q_head_base = kv_head * self.group_size
-        gPartialO = mPartialO[split_idx, None, None]
-        gPartialMax = mPartialMax[split_idx, None]
-        gPartialSum = mPartialSum[split_idx, None]
+        kv_head, _, _ = cute.arch.block_idx()
+        thr = tiled_in.get_slice(tidx)
 
-        tile_start = split_idx * self.block_seq
-        for tile_start in cutlass.range(tile_start, seq_len, split_stride, unroll=1):
+        q_tile = cute.local_tile(mQ, (self.group_size, self.head_dim), (kv_head, 0))
+        o_tile = cute.local_tile(mO, (self.group_size, self.head_dim), (kv_head, 0))
+
+        q_regs = []
+        acc_regs = []
+        running_max = []
+        running_sum = []
+
+        for h in cutlass.range_constexpr(self.group_size):
+            q_row = cute.local_tile(q_tile, (1, self.head_dim), (h, 0))
+            tQgQ = thr.partition_S(q_row)
+            tQr = cute.make_rmem_tensor_like(tQgQ)
+            cute.copy(tiled_in, tQgQ, tQr)
+            q_vec = tQr.load().to(Float32)
+            q_regs.append(q_vec)
+            acc_regs.append(q_vec * 0.0)
+            running_max.append(-Float32.inf)
+            running_sum.append(0.0)
+
+        seq_len = mK.shape[1]
+        num_tiles = cute.ceil_div(seq_len, self.block_seq)
+        k_head = mK[kv_head, None, None]
+        v_head = mV[kv_head, None, None]
+
+        for tile_idx in cutlass.range(num_tiles, unroll=1):
+            k_tile = cute.local_tile(k_head, (self.block_seq, self.head_dim), (tile_idx, 0))
+            v_tile = cute.local_tile(v_head, (self.block_seq, self.head_dim), (tile_idx, 0))
+            tile_start = tile_idx * self.block_seq
             for row in cutlass.range_constexpr(self.block_seq):
                 seq_idx = tile_start + row
                 if seq_idx < seq_len:
+                    k_row = cute.local_tile(k_tile, (1, self.head_dim), (row, 0))
+                    v_row = cute.local_tile(v_tile, (1, self.head_dim), (row, 0))
+                    tKgK = thr.partition_S(k_row)
+                    tVgV = thr.partition_S(v_row)
+                    tKr = cute.make_rmem_tensor_like(tKgK)
+                    tVr = cute.make_rmem_tensor_like(tVgV)
+                    cute.copy(tiled_in, tKgK, tKr)
+                    cute.copy(tiled_in, tVgV, tVr)
+                    k_vec = tKr.load().to(Float32)
+                    v_vec = tVr.load().to(Float32)
+
                     for h in cutlass.range_constexpr(self.group_size):
-                        qh = q_head_base + h
-                        score = 0.0
-                        for i in cutlass.range_constexpr(self.frag_elems):
-                            dim = frag_base + i
-                            score += (
-                                mQ[qh, dim].to(Float32) * mK[kv_head, seq_idx, dim].to(Float32)
-                            )
+                        score = (q_regs[h] * k_vec).reduce(
+                            cute.ReductionOp.ADD,
+                            init_val=0.0,
+                            reduction_profile=0,
+                        )
                         score = cute.arch.warp_reduction(score, operator.add) * self.scale
-                        max_prev = gPartialMax[qh]
-                        sum_prev = gPartialSum[qh]
-                        max_next = cute.arch.fmax(max_prev, score)
+                        max_next = cute.arch.fmax(running_max[h], score)
                         old_scale = cute.math.exp2(
-                            (max_prev - max_next) * LOG2_E,
+                            (running_max[h] - max_next) * LOG2_E,
                             fastmath=True,
                         )
                         score_scale = cute.math.exp2((score - max_next) * LOG2_E, fastmath=True)
-                        for i in cutlass.range_constexpr(self.frag_elems):
-                            dim = frag_base + i
-                            gPartialO[qh, dim] = (
-                                gPartialO[qh, dim] * old_scale
-                                + mV[kv_head, seq_idx, dim].to(Float32) * score_scale
-                            )
-                        if tidx == 0:
-                            gPartialSum[qh] = sum_prev * old_scale + score_scale
-                            gPartialMax[qh] = max_next
-                        cute.arch.barrier()
+                        running_max[h] = max_next
+                        running_sum[h] = running_sum[h] * old_scale + score_scale
+                        acc_regs[h] = acc_regs[h] * old_scale + v_vec * score_scale
+
+        for h in cutlass.range_constexpr(self.group_size):
+            out_row = cute.local_tile(o_tile, (1, self.head_dim), (h, 0))
+            tOgO = thr.partition_D(out_row)
+            tOrO = cute.make_rmem_tensor_like(tOgO)
+            out = acc_regs[h] * cute.arch.rcp_approx(running_sum[h])
+            tOrO.store(out.to(tOrO.element_type))
+            copy_utils.copy(tOrO, tOgO)
 
 
 @lru_cache(maxsize=None)
-def _compile_decode_partial(dtype, head_dim: int, group_size: int, block_seq: int, smem_pad: int):
+def _compile_decode(dtype, head_dim: int, group_size: int, block_seq: int):
     q_heads = cute.sym_int()
     kv_heads = cute.sym_int()
     seq_len = cute.sym_int()
-    num_splits = cute.sym_int()
     q_cute = make_fake_tensor(dtype, (q_heads, head_dim), divisibility=16 // (dtype.width // 8))
-    k_cute = make_fake_tensor(dtype, (kv_heads, seq_len, head_dim), divisibility=16 // (dtype.width // 8))
-    v_cute = make_fake_tensor(dtype, (kv_heads, seq_len, head_dim), divisibility=16 // (dtype.width // 8))
-    po_cute = make_fake_tensor(Float32, (num_splits, q_heads, head_dim), divisibility=1)
-    pm_cute = make_fake_tensor(Float32, (num_splits, q_heads), divisibility=1)
-    ps_cute = make_fake_tensor(Float32, (num_splits, q_heads), divisibility=1)
-    kernel = DecodePartialKernel(dtype, head_dim=head_dim, group_size=group_size, block_seq=block_seq, smem_pad=smem_pad)
+    k_cute = make_fake_tensor(
+        dtype,
+        (kv_heads, seq_len, head_dim),
+        divisibility=16 // (dtype.width // 8),
+    )
+    v_cute = make_fake_tensor(
+        dtype,
+        (kv_heads, seq_len, head_dim),
+        divisibility=16 // (dtype.width // 8),
+    )
+    o_cute = make_fake_tensor(dtype, (q_heads, head_dim), divisibility=16 // (dtype.width // 8))
+    kernel = DirectDecodeKernel(dtype, head_dim=head_dim, group_size=group_size, block_seq=block_seq)
     return cute.compile(
         kernel,
         q_cute,
         k_cute,
         v_cute,
-        po_cute,
-        pm_cute,
-        ps_cute,
+        o_cute,
         CUDA_STREAM,
         options="--enable-tvm-ffi",
     )
-
-
-def _launch_partial_kernel(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    num_splits: int,
-    config: GQADecodeConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_q_heads, head_dim = q.shape
-    num_kv_heads = k_cache.shape[0]
-    group_size = num_q_heads // num_kv_heads
-    partial_out = torch.zeros(
-        (num_splits, num_q_heads, head_dim),
-        device=q.device,
-        dtype=torch.float32,
-    )
-    partial_max = torch.full(
-        (num_splits, num_q_heads),
-        fill_value=-torch.inf,
-        device=q.device,
-        dtype=torch.float32,
-    )
-    partial_sum = torch.zeros(
-        (num_splits, num_q_heads),
-        device=q.device,
-        dtype=torch.float32,
-    )
-    dtype = torch2cute_dtype_map[q.dtype]
-    compiled = _compile_decode_partial(dtype, head_dim, group_size, config.block_seq, config.smem_pad)
-    compiled(q, k_cache, v_cache, partial_out, partial_max, partial_sum)
-    return partial_out, partial_max, partial_sum
 
 
 def gqa_decode_attention(
@@ -252,7 +225,7 @@ def gqa_decode_attention(
     *,
     num_splits: int | None = None,
     config: GQADecodeConfig | None = None,
-    backend: str = "auto",
+    backend: str = "cute",
 ) -> torch.Tensor:
     if q.dim() != 2 or k_cache.dim() != 3 or v_cache.dim() != 3:
         raise ValueError("Expected q=(num_q_heads, head_dim), k/v=(num_kv_heads, seq_len, head_dim)")
@@ -267,34 +240,23 @@ def gqa_decode_attention(
     if not (q.is_contiguous() and k_cache.is_contiguous() and v_cache.is_contiguous()):
         raise ValueError("Q/K/V must be contiguous")
     num_q_heads, head_dim = q.shape
-    num_kv_heads, seq_len, kv_head_dim = k_cache.shape
+    num_kv_heads, _, kv_head_dim = k_cache.shape
     if kv_head_dim != head_dim:
         raise ValueError("Q/K/V head_dim mismatch")
     if num_q_heads % num_kv_heads != 0:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
-    if backend not in {"auto", "cute", "torch"}:
-        raise ValueError("backend must be one of {'auto', 'cute', 'torch'}")
-    if config is None:
-        config = GQADecodeConfig()
-    if num_splits is None:
-        num_splits = select_num_splits(
-            num_kv_heads=num_kv_heads,
-            seq_len=seq_len,
-            block_seq=config.block_seq,
-            target_blocks_per_sm=config.target_blocks_per_sm,
-        )
+    if backend not in {"cute", "torch"}:
+        raise ValueError("backend must be one of {'cute', 'torch'}")
     if backend == "torch":
         return reference_gqa_decode(q, k_cache, v_cache, num_kv_heads=num_kv_heads)
-    try:
-        partial_out, partial_max, partial_sum = _launch_partial_kernel(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            num_splits=num_splits,
-            config=config,
-        )
-        return _reduce_partial_results(partial_out, partial_max, partial_sum, q.dtype)
-    except Exception:
-        if backend == "cute":
-            raise
-        return reference_gqa_decode(q, k_cache, v_cache, num_kv_heads=num_kv_heads)
+    if config is None:
+        config = GQADecodeConfig()
+    if num_splits not in (None, 1):
+        raise NotImplementedError("split-K path is not implemented in the current CuTe kernel")
+
+    group_size = num_q_heads // num_kv_heads
+    dtype = torch2cute_dtype_map[q.dtype]
+    out = torch.empty_like(q)
+    compiled = _compile_decode(dtype, head_dim, group_size, config.block_seq)
+    compiled(q, k_cache, v_cache, out)
+    return out
