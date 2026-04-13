@@ -106,12 +106,14 @@ class DirectDecodeKernel:
     def __init__(
         self, dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int = 1
     ):
-        if head_dim not in (64, 128):
-            raise ValueError(f"Unsupported head_dim={head_dim}; expected 64 or 128")
+        if head_dim not in (64, 128, 256):
+            raise ValueError(
+                f"Unsupported head_dim={head_dim}; expected 64, 128, or 256"
+            )
         if head_dim % cute.arch.WARP_SIZE != 0:
             raise ValueError("head_dim must be divisible by warp size")
-        if group_size < 1 or group_size > 8:
-            raise ValueError("group_size must be in [1, 8]")
+        if group_size < 1 or group_size > 16:
+            raise ValueError("group_size must be in [1, 16]")
         self.dtype = dtype
         self.head_dim = head_dim
         self.group_size = group_size
@@ -236,12 +238,14 @@ class SplitKDecodeKernel:
     def __init__(
         self, dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int
     ):
-        if head_dim not in (64, 128):
-            raise ValueError(f"Unsupported head_dim={head_dim}; expected 64 or 128")
+        if head_dim not in (64, 128, 256):
+            raise ValueError(
+                f"Unsupported head_dim={head_dim}; expected 64, 128, or 256"
+            )
         if head_dim % cute.arch.WARP_SIZE != 0:
             raise ValueError("head_dim must be divisible by warp size")
-        if group_size < 1 or group_size > 8:
-            raise ValueError("group_size must be in [1, 8]")
+        if group_size < 1 or group_size > 16:
+            raise ValueError("group_size must be in [1, 16]")
         self.dtype = dtype
         self.head_dim = head_dim
         self.group_size = group_size
@@ -601,6 +605,45 @@ def _compile_splitk(
     )
 
 
+@lru_cache(maxsize=None)
+def _compile_double_buffer_splitk(
+    dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int
+):
+    q_heads = cute.sym_int()
+    kv_heads = cute.sym_int()
+    seq_len = cute.sym_int()
+    total_partials = cute.sym_int()
+    div = 16 // (dtype.width // 8)
+    q_cute = make_fake_tensor(dtype, (q_heads, head_dim), divisibility=div)
+    k_cute = make_fake_tensor(dtype, (kv_heads, seq_len, head_dim), divisibility=div)
+    v_cute = make_fake_tensor(dtype, (kv_heads, seq_len, head_dim), divisibility=div)
+    po_cute = make_fake_tensor(dtype, (total_partials, head_dim), divisibility=div)
+    pm_cute = make_fake_tensor(
+        Float32, (total_partials, head_dim), divisibility=16 // (Float32.width // 8)
+    )
+    ps_cute = make_fake_tensor(
+        Float32, (total_partials, head_dim), divisibility=16 // (Float32.width // 8)
+    )
+    kernel = DoubleBufferSplitKKernel(
+        dtype,
+        head_dim=head_dim,
+        group_size=group_size,
+        block_seq=block_seq,
+        num_splits=num_splits,
+    )
+    return cute.compile(
+        kernel,
+        q_cute,
+        k_cute,
+        v_cute,
+        po_cute,
+        pm_cute,
+        ps_cute,
+        CUDA_STREAM,
+        options="--enable-tvm-ffi",
+    )
+
+
 def reduce_partials(
     partial_out: torch.Tensor,
     partial_max: torch.Tensor,
@@ -698,8 +741,12 @@ def gqa_decode_attention(
         total_partials, head_dim, dtype=torch.float32, device=q.device
     )
 
-    compiled = _compile_splitk(
-        dtype, head_dim, group_size, config.block_seq, actual_splits
+    compiled = (
+        _compile_splitk(dtype, head_dim, group_size, config.block_seq, actual_splits)
+        if group_size == 1
+        else _compile_double_buffer_splitk(
+            dtype, head_dim, group_size, config.block_seq, actual_splits
+        )
     )
     compiled(q, k_cache, v_cache, partial_out, partial_max, partial_sum)
 
@@ -987,10 +1034,290 @@ class PersistentDecodeKernel:
 
                 sum_vec = q_regs[h] * Float32(0.0) + running_sum[h]
                 ps_row = cute.local_tile(mPartialSum, (1, self.head_dim), (pr, 0))
-                tSgS = thr_f32.partition_D(ps_row)
-                tSrS = cute.make_rmem_tensor_like(tSgS)
-                tSrS.store(sum_vec)
-                copy_utils.copy(tSrS, tSgS)
+            tSgS = thr_f32.partition_D(ps_row)
+            tSrS = cute.make_rmem_tensor_like(tSgS)
+            tSrS.store(sum_vec)
+            copy_utils.copy(tSrS, tSgS)
+
+
+class DoubleBufferSplitKKernel:
+    """Split-K GQA decode with double-buffered cp.async pipeline.
+
+    Overlaps K/V tile load for tile T+1 with attention compute for tile T,
+    keeping the HBM DMA engine busy during compute to close the 3× gap vs
+    FlashInfer on production GQA configs (Llama, Qwen).
+
+    Work assignment is identical to SplitKDecodeKernel (used for GQA only,
+    i.e. group_size > 1). MHA stays on the single-buffer kernel.
+
+    Buffer layout:
+        A (sK_A / sV_A) holds the EVEN tile within each pair.
+        B (sK_B / sV_B) holds the ODD tile within each pair.
+
+    Pipeline per pair (tiles 2p, 2p+1):
+        1. A is already ready (prologue or previous pair waited for it).
+        2. Issue async load of tile 2p+1 → B  [non-blocking]
+        3. Commit group.
+        4. Compute tile 2p from A              [overlaps with step 2]
+        5. Wait for B (tile 2p+1 ready).
+        6. Issue async load of tile 2(p+1) → A  [non-blocking]
+        7. Commit group.
+        8. Compute tile 2p+1 from B            [overlaps with step 6]
+        9. Wait for A (tile 2(p+1) ready).  ← A ready for next pair.
+    """
+
+    def __init__(
+        self, dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int
+    ):
+        if head_dim not in (64, 128, 256):
+            raise ValueError(
+                f"Unsupported head_dim={head_dim}; expected 64, 128, or 256"
+            )
+        if head_dim % cute.arch.WARP_SIZE != 0:
+            raise ValueError("head_dim must be divisible by warp size")
+        if group_size < 1 or group_size > 16:
+            raise ValueError("group_size must be in [1, 16]")
+        self.dtype = dtype
+        self.head_dim = head_dim
+        self.group_size = group_size
+        self.block_seq = block_seq
+        self.num_splits = num_splits
+        self.vec = head_dim // cute.arch.WARP_SIZE
+        self.scale = float(head_dim**-0.5)
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mPartialO: cute.Tensor,
+        mPartialMax: cute.Tensor,
+        mPartialSum: cute.Tensor,
+        stream=None,
+    ):
+        tiled_in = copy_utils.tiled_copy_2d(self.dtype, 32, 32, self.vec)
+        tiled_f32 = copy_utils.tiled_copy_2d(Float32, 32, 32, self.vec)
+        self.kernel(
+            mQ, mK, mV, mPartialO, mPartialMax, mPartialSum, tiled_in, tiled_f32
+        ).launch(
+            grid=[mK.shape[0], self.num_splits, 1],
+            block=[32, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mPartialO: cute.Tensor,
+        mPartialMax: cute.Tensor,
+        mPartialSum: cute.Tensor,
+        tiled_in: cute.TiledCopy,
+        tiled_f32: cute.TiledCopy,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        kv_head, split_idx, _ = cute.arch.block_idx()
+        thr = tiled_in.get_slice(tidx)
+        thr_f32 = tiled_f32.get_slice(tidx)
+
+        q_tile = cute.local_tile(mQ, (self.group_size, self.head_dim), (kv_head, 0))
+
+        q_regs = []
+        acc_regs = []
+        running_max = []
+        running_sum = []
+
+        for h in cutlass.range_constexpr(self.group_size):
+            q_row = cute.local_tile(q_tile, (1, self.head_dim), (h, 0))
+            tQgQ = thr.partition_S(q_row)
+            tQr = cute.make_rmem_tensor_like(tQgQ)
+            cute.copy(tiled_in, tQgQ, tQr)
+            q_vec = tQr.load().to(Float32)
+            q_regs.append(q_vec)
+            acc_regs.append(q_vec * 0.0)
+            running_max.append(-Float32.inf)
+            running_sum.append(0.0)
+
+        seq_len = mK.shape[1]
+        total_tiles = cute.ceil_div(seq_len, self.block_seq)
+        tiles_per_split = cute.ceil_div(total_tiles, self.num_splits)
+        first_tile = split_idx * tiles_per_split
+        k_head = mK[kv_head, None, None]
+        v_head = mV[kv_head, None, None]
+
+        # Two SMEM buffers: A for even tiles, B for odd tiles
+        smem = cutlass.utils.SmemAllocator()
+        smem_layout = cute.make_layout(
+            (self.block_seq, self.head_dim),
+            stride=(self.head_dim + SMEM_PAD, 1),
+        )
+        sK_A = smem.allocate_tensor(self.dtype, smem_layout, byte_alignment=16)
+        sV_A = smem.allocate_tensor(self.dtype, smem_layout, byte_alignment=16)
+        sK_B = smem.allocate_tensor(self.dtype, smem_layout, byte_alignment=16)
+        sV_B = smem.allocate_tensor(self.dtype, smem_layout, byte_alignment=16)
+
+        tKsK_A = thr.partition_D(sK_A)
+        tVsV_A = thr.partition_D(sV_A)
+        tKsK_B = thr.partition_D(sK_B)
+        tVsV_B = thr.partition_D(sV_B)
+
+        # ---- PROLOGUE: issue async load of tile 0 (even) into A ----
+        if first_tile < total_tiles:
+            k_t = cute.local_tile(
+                k_head, (self.block_seq, self.head_dim), (first_tile, 0)
+            )
+            v_t = cute.local_tile(
+                v_head, (self.block_seq, self.head_dim), (first_tile, 0)
+            )
+            copy_utils.copy(thr.partition_S(k_t), tKsK_A, is_async=True)
+            copy_utils.copy(thr.partition_S(v_t), tVsV_A, is_async=True)
+            cute.arch.cp_async_commit_group()
+
+        total_pairs = cute.ceil_div(tiles_per_split, 2)
+
+        # ---- PAIR LOOP: A always has the even tile, B always has the odd tile ----
+        for pair in cutlass.range(total_pairs, unroll=1):
+            even_tile = first_tile + pair * 2
+            odd_tile = first_tile + pair * 2 + 1
+            split_end = first_tile + tiles_per_split
+
+            # Wait for A (even tile) — committed in prologue or end of previous pair
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            # Issue async load of odd tile into B (non-blocking)
+            if odd_tile < total_tiles and odd_tile < split_end:
+                k_odd = cute.local_tile(
+                    k_head, (self.block_seq, self.head_dim), (odd_tile, 0)
+                )
+                v_odd = cute.local_tile(
+                    v_head, (self.block_seq, self.head_dim), (odd_tile, 0)
+                )
+                copy_utils.copy(thr.partition_S(k_odd), tKsK_B, is_async=True)
+                copy_utils.copy(thr.partition_S(v_odd), tVsV_B, is_async=True)
+                cute.arch.cp_async_commit_group()
+
+            # Compute even tile from A (overlaps with odd tile loading above)
+            if even_tile < total_tiles:
+                even_start = even_tile * self.block_seq
+                for row in cutlass.range_constexpr(self.block_seq):
+                    seq_idx = even_start + row
+                    if seq_idx < seq_len:
+                        sK_row = cute.local_tile(sK_A, (1, self.head_dim), (row, 0))
+                        sV_row = cute.local_tile(sV_A, (1, self.head_dim), (row, 0))
+                        tKr = cute.make_rmem_tensor_like(thr.partition_S(sK_row))
+                        tVr = cute.make_rmem_tensor_like(thr.partition_S(sV_row))
+                        cute.copy(tiled_in, thr.partition_S(sK_row), tKr)
+                        cute.copy(tiled_in, thr.partition_S(sV_row), tVr)
+                        k_vec = tKr.load().to(Float32)
+                        v_vec = tVr.load().to(Float32)
+                        for h in cutlass.range_constexpr(self.group_size):
+                            score = (q_regs[h] * k_vec).reduce(
+                                cute.ReductionOp.ADD,
+                                init_val=0.0,
+                                reduction_profile=0,
+                            )
+                            score = (
+                                cute.arch.warp_reduction(score, operator.add)
+                                * self.scale
+                            )
+                            max_next = cute.arch.fmax(running_max[h], score)
+                            old_scale = cute.math.exp2(
+                                (running_max[h] - max_next) * LOG2_E, fastmath=True
+                            )
+                            score_scale = cute.math.exp2(
+                                (score - max_next) * LOG2_E, fastmath=True
+                            )
+                            running_max[h] = max_next
+                            running_sum[h] = running_sum[h] * old_scale + score_scale
+                            acc_regs[h] = acc_regs[h] * old_scale + v_vec * score_scale
+
+            # Handle odd tile if it exists
+            if odd_tile < total_tiles and odd_tile < split_end:
+                # Wait for B (odd tile ready)
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+
+                # Issue async load of next even tile into A (non-blocking)
+                next_even = first_tile + (pair + 1) * 2
+                if next_even < total_tiles and next_even < split_end:
+                    k_ne = cute.local_tile(
+                        k_head, (self.block_seq, self.head_dim), (next_even, 0)
+                    )
+                    v_ne = cute.local_tile(
+                        v_head, (self.block_seq, self.head_dim), (next_even, 0)
+                    )
+                    copy_utils.copy(thr.partition_S(k_ne), tKsK_A, is_async=True)
+                    copy_utils.copy(thr.partition_S(v_ne), tVsV_A, is_async=True)
+                    cute.arch.cp_async_commit_group()
+
+                # Compute odd tile from B (overlaps with next even tile loading above)
+                odd_start = odd_tile * self.block_seq
+                for row in cutlass.range_constexpr(self.block_seq):
+                    seq_idx = odd_start + row
+                    if seq_idx < seq_len:
+                        sK_row = cute.local_tile(sK_B, (1, self.head_dim), (row, 0))
+                        sV_row = cute.local_tile(sV_B, (1, self.head_dim), (row, 0))
+                        tKr = cute.make_rmem_tensor_like(thr.partition_S(sK_row))
+                        tVr = cute.make_rmem_tensor_like(thr.partition_S(sV_row))
+                        cute.copy(tiled_in, thr.partition_S(sK_row), tKr)
+                        cute.copy(tiled_in, thr.partition_S(sV_row), tVr)
+                        k_vec = tKr.load().to(Float32)
+                        v_vec = tVr.load().to(Float32)
+                        for h in cutlass.range_constexpr(self.group_size):
+                            score = (q_regs[h] * k_vec).reduce(
+                                cute.ReductionOp.ADD,
+                                init_val=0.0,
+                                reduction_profile=0,
+                            )
+                            score = (
+                                cute.arch.warp_reduction(score, operator.add)
+                                * self.scale
+                            )
+                            max_next = cute.arch.fmax(running_max[h], score)
+                            old_scale = cute.math.exp2(
+                                (running_max[h] - max_next) * LOG2_E, fastmath=True
+                            )
+                            score_scale = cute.math.exp2(
+                                (score - max_next) * LOG2_E, fastmath=True
+                            )
+                            running_max[h] = max_next
+                            running_sum[h] = running_sum[h] * old_scale + score_scale
+                            acc_regs[h] = acc_regs[h] * old_scale + v_vec * score_scale
+
+                # Wait for A (next even tile) so it's ready at start of next pair
+                next_even2 = first_tile + (pair + 1) * 2
+                if next_even2 < total_tiles and next_even2 < split_end:
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.barrier()
+
+        # Write partial results (identical to SplitKDecodeKernel)
+        for h in cutlass.range_constexpr(self.group_size):
+            q_head_global = kv_head * self.group_size + h
+            partial_row = q_head_global * self.num_splits + split_idx
+
+            po_row = cute.local_tile(mPartialO, (1, self.head_dim), (partial_row, 0))
+            tOgO = thr.partition_D(po_row)
+            tOrO = cute.make_rmem_tensor_like(tOgO)
+            tOrO.store(acc_regs[h].to(tOrO.element_type))
+            copy_utils.copy(tOrO, tOgO)
+
+            max_vec = q_regs[h] * 0.0 + running_max[h]
+            pm_row = cute.local_tile(mPartialMax, (1, self.head_dim), (partial_row, 0))
+            tMgM = thr_f32.partition_D(pm_row)
+            tMrM = cute.make_rmem_tensor_like(tMgM)
+            tMrM.store(max_vec)
+            copy_utils.copy(tMrM, tMgM)
+
+            sum_vec = q_regs[h] * 0.0 + running_sum[h]
+            ps_row = cute.local_tile(mPartialSum, (1, self.head_dim), (partial_row, 0))
+            tSgS = thr_f32.partition_D(ps_row)
+            tSrS = cute.make_rmem_tensor_like(tSgS)
+            tSrS.store(sum_vec)
+            copy_utils.copy(tSrS, tSgS)
 
 
 @lru_cache(maxsize=None)
