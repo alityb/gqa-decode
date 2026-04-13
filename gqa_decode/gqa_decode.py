@@ -194,6 +194,151 @@ class DirectDecodeKernel:
             copy_utils.copy(tOrO, tOgO)
 
 
+class SplitKDecodeKernel:
+    """Split-K kernel that writes partial (unnormalized) results."""
+
+    def __init__(self, dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int):
+        if head_dim not in (64, 128):
+            raise ValueError(f"Unsupported head_dim={head_dim}; expected 64 or 128")
+        if head_dim % cute.arch.WARP_SIZE != 0:
+            raise ValueError("head_dim must be divisible by warp size")
+        if group_size < 1 or group_size > 8:
+            raise ValueError("group_size must be in [1, 8]")
+        self.dtype = dtype
+        self.head_dim = head_dim
+        self.group_size = group_size
+        self.block_seq = block_seq
+        self.num_splits = num_splits
+        self.vec = head_dim // cute.arch.WARP_SIZE
+        self.scale = float(head_dim**-0.5)
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mPartialO: cute.Tensor,
+        mPartialMax: cute.Tensor,
+        mPartialSum: cute.Tensor,
+        stream=None,
+    ):
+        tiled_in = copy_utils.tiled_copy_2d(self.dtype, 32, 32, self.vec)
+        tiled_f32 = copy_utils.tiled_copy_2d(Float32, 32, 32, self.vec)
+        self.kernel(mQ, mK, mV, mPartialO, mPartialMax, mPartialSum, tiled_in, tiled_f32).launch(
+            grid=[mK.shape[0], self.num_splits, 1],
+            block=[32, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mPartialO: cute.Tensor,
+        mPartialMax: cute.Tensor,
+        mPartialSum: cute.Tensor,
+        tiled_in: cute.TiledCopy,
+        tiled_f32: cute.TiledCopy,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        kv_head, split_idx, _ = cute.arch.block_idx()
+        thr = tiled_in.get_slice(tidx)
+        thr_f32 = tiled_f32.get_slice(tidx)
+
+        q_tile = cute.local_tile(mQ, (self.group_size, self.head_dim), (kv_head, 0))
+
+        q_regs = []
+        acc_regs = []
+        running_max = []
+        running_sum = []
+
+        for h in cutlass.range_constexpr(self.group_size):
+            q_row = cute.local_tile(q_tile, (1, self.head_dim), (h, 0))
+            tQgQ = thr.partition_S(q_row)
+            tQr = cute.make_rmem_tensor_like(tQgQ)
+            cute.copy(tiled_in, tQgQ, tQr)
+            q_vec = tQr.load().to(Float32)
+            q_regs.append(q_vec)
+            acc_regs.append(q_vec * 0.0)
+            running_max.append(-Float32.inf)
+            running_sum.append(0.0)
+
+        seq_len = mK.shape[1]
+        total_tiles = cute.ceil_div(seq_len, self.block_seq)
+        tiles_per_split = cute.ceil_div(total_tiles, self.num_splits)
+        first_tile = split_idx * tiles_per_split
+        k_head = mK[kv_head, None, None]
+        v_head = mV[kv_head, None, None]
+
+        for local_tile_idx in cutlass.range(tiles_per_split, unroll=1):
+            tile_idx = first_tile + local_tile_idx
+            if tile_idx < total_tiles:
+                k_tile = cute.local_tile(k_head, (self.block_seq, self.head_dim), (tile_idx, 0))
+                v_tile = cute.local_tile(v_head, (self.block_seq, self.head_dim), (tile_idx, 0))
+                tile_start = tile_idx * self.block_seq
+                for row in cutlass.range_constexpr(self.block_seq):
+                    seq_idx = tile_start + row
+                    if seq_idx < seq_len:
+                        k_row = cute.local_tile(k_tile, (1, self.head_dim), (row, 0))
+                        v_row = cute.local_tile(v_tile, (1, self.head_dim), (row, 0))
+                        tKgK = thr.partition_S(k_row)
+                        tVgV = thr.partition_S(v_row)
+                        tKr = cute.make_rmem_tensor_like(tKgK)
+                        tVr = cute.make_rmem_tensor_like(tVgV)
+                        cute.copy(tiled_in, tKgK, tKr)
+                        cute.copy(tiled_in, tVgV, tVr)
+                        k_vec = tKr.load().to(Float32)
+                        v_vec = tVr.load().to(Float32)
+
+                        for h in cutlass.range_constexpr(self.group_size):
+                            score = (q_regs[h] * k_vec).reduce(
+                                cute.ReductionOp.ADD,
+                                init_val=0.0,
+                                reduction_profile=0,
+                            )
+                            score = cute.arch.warp_reduction(score, operator.add) * self.scale
+                            max_next = cute.arch.fmax(running_max[h], score)
+                            old_scale = cute.math.exp2(
+                                (running_max[h] - max_next) * LOG2_E,
+                                fastmath=True,
+                            )
+                            score_scale = cute.math.exp2((score - max_next) * LOG2_E, fastmath=True)
+                            running_max[h] = max_next
+                            running_sum[h] = running_sum[h] * old_scale + score_scale
+                            acc_regs[h] = acc_regs[h] * old_scale + v_vec * score_scale
+
+        # Write partial results for split-K reduction
+        for h in cutlass.range_constexpr(self.group_size):
+            q_head_global = kv_head * self.group_size + h
+            partial_row = q_head_global * self.num_splits + split_idx
+
+            # Unnormalized accumulator (BF16)
+            po_row = cute.local_tile(mPartialO, (1, self.head_dim), (partial_row, 0))
+            tOgO = thr.partition_D(po_row)
+            tOrO = cute.make_rmem_tensor_like(tOgO)
+            tOrO.store(acc_regs[h].to(tOrO.element_type))
+            copy_utils.copy(tOrO, tOgO)
+
+            # Broadcast running_max to vector and write (FP32)
+            max_vec = q_regs[h] * 0.0 + running_max[h]
+            pm_row = cute.local_tile(mPartialMax, (1, self.head_dim), (partial_row, 0))
+            tMgM = thr_f32.partition_D(pm_row)
+            tMrM = cute.make_rmem_tensor_like(tMgM)
+            tMrM.store(max_vec)
+            copy_utils.copy(tMrM, tMgM)
+
+            # Broadcast running_sum to vector and write (FP32)
+            sum_vec = q_regs[h] * 0.0 + running_sum[h]
+            ps_row = cute.local_tile(mPartialSum, (1, self.head_dim), (partial_row, 0))
+            tSgS = thr_f32.partition_D(ps_row)
+            tSrS = cute.make_rmem_tensor_like(tSgS)
+            tSrS.store(sum_vec)
+            copy_utils.copy(tSrS, tSgS)
+
+
 @lru_cache(maxsize=None)
 def _compile_decode(dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int = 1):
     q_heads = cute.sym_int()
@@ -221,6 +366,53 @@ def _compile_decode(dtype, head_dim: int, group_size: int, block_seq: int, num_s
         CUDA_STREAM,
         options="--enable-tvm-ffi",
     )
+
+
+@lru_cache(maxsize=None)
+def _compile_splitk(dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int):
+    q_heads = cute.sym_int()
+    kv_heads = cute.sym_int()
+    seq_len = cute.sym_int()
+    total_partials = cute.sym_int()
+    div = 16 // (dtype.width // 8)
+    q_cute = make_fake_tensor(dtype, (q_heads, head_dim), divisibility=div)
+    k_cute = make_fake_tensor(dtype, (kv_heads, seq_len, head_dim), divisibility=div)
+    v_cute = make_fake_tensor(dtype, (kv_heads, seq_len, head_dim), divisibility=div)
+    po_cute = make_fake_tensor(dtype, (total_partials, head_dim), divisibility=div)
+    pm_cute = make_fake_tensor(Float32, (total_partials, head_dim), divisibility=16 // (Float32.width // 8))
+    ps_cute = make_fake_tensor(Float32, (total_partials, head_dim), divisibility=16 // (Float32.width // 8))
+    kernel = SplitKDecodeKernel(
+        dtype, head_dim=head_dim, group_size=group_size, block_seq=block_seq, num_splits=num_splits,
+    )
+    return cute.compile(
+        kernel,
+        q_cute, k_cute, v_cute, po_cute, pm_cute, ps_cute,
+        CUDA_STREAM,
+        options="--enable-tvm-ffi",
+    )
+
+
+def reduce_partials(
+    partial_out: torch.Tensor,
+    partial_max: torch.Tensor,
+    partial_sum: torch.Tensor,
+    num_q_heads: int,
+    num_splits: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Combine split-K partial results using online softmax correction."""
+    out_dtype = partial_out.dtype
+    partial_out = partial_out.view(num_q_heads, num_splits, head_dim).float()
+    # Max/sum are broadcast across head_dim; extract column 0 for the scalar
+    partial_max = partial_max.view(num_q_heads, num_splits, head_dim)[:, :, 0]
+    partial_sum = partial_sum.view(num_q_heads, num_splits, head_dim)[:, :, 0]
+
+    global_max = partial_max.max(dim=1, keepdim=True).values
+    correction = torch.exp(partial_max - global_max)
+    corrected_sum = (partial_sum * correction).sum(dim=1, keepdim=True)
+    corrected_out = (partial_out * correction.unsqueeze(-1)).sum(dim=1)
+
+    return (corrected_out / corrected_sum).to(out_dtype)
 
 
 def gqa_decode_attention(
@@ -257,11 +449,18 @@ def gqa_decode_attention(
     if config is None:
         config = GQADecodeConfig()
     if num_splits not in (None, 1):
-        raise NotImplementedError("split-K path is not implemented in the current CuTe kernel")
+        raise NotImplementedError("multi-split not yet enabled (Step 3)")
 
     group_size = num_q_heads // num_kv_heads
     dtype = torch2cute_dtype_map[q.dtype]
-    out = torch.empty_like(q)
-    compiled = _compile_decode(dtype, head_dim, group_size, config.block_seq)
-    compiled(q, k_cache, v_cache, out)
-    return out
+    actual_splits = 1
+
+    total_partials = num_q_heads * actual_splits
+    partial_out = torch.empty(total_partials, head_dim, dtype=q.dtype, device=q.device)
+    partial_max = torch.empty(total_partials, head_dim, dtype=torch.float32, device=q.device)
+    partial_sum = torch.empty(total_partials, head_dim, dtype=torch.float32, device=q.device)
+
+    compiled = _compile_splitk(dtype, head_dim, group_size, config.block_seq, actual_splits)
+    compiled(q, k_cache, v_cache, partial_out, partial_max, partial_sum)
+
+    return reduce_partials(partial_out, partial_max, partial_sum, num_q_heads, actual_splits, head_dim)
