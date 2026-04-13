@@ -19,8 +19,8 @@ from gqa_decode.cute_dsl_utils import make_fake_tensor, torch2cute_dtype_map
 CUDA_STREAM = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 LOG2_E = math.log2(math.e)
 HBM_PEAK_BW = 3.35e12
-DEFAULT_BLOCK_SEQ = 32
-DEFAULT_TARGET_BLOCKS_PER_SM = 10
+DEFAULT_BLOCK_SEQ = 16
+DEFAULT_TARGET_BLOCKS_PER_SM = 16
 NUM_SMS_H100_SXM = 132
 SMEM_PAD = 8
 
@@ -89,9 +89,9 @@ def select_num_splits(
     smem_per_sm = 228 * 1024  # H100 SXM
     max_blocks_per_sm = max(1, smem_per_sm // smem_per_block - 1)
 
-    # Fill one wave up to the SMEM ceiling — exceeding this causes a
-    # multi-wave penalty that drops DRAM throughput by ~20 percentage points.
-    max_grid = num_sms * max_blocks_per_sm
+    # Use target occupancy, capped by SMEM ceiling to stay within one wave.
+    blocks_per_sm = min(target_blocks_per_sm, max_blocks_per_sm)
+    max_grid = num_sms * blocks_per_sm
     min_splits = max(1, max_grid // num_kv_heads)
     max_tiles = max(1, math.ceil(seq_len / block_seq))
     return min(min_splits, max_tiles)
