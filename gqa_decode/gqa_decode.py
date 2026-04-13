@@ -63,6 +63,15 @@ def reference_gqa_decode(
     return out.to(dtype=q.dtype)
 
 
+def _smem_bytes_per_block(block_seq: int, head_dim: int, smem_pad: int, elem_bytes: int = 2) -> int:
+    """SMEM usage: two padded tiles for K and V, plus allocator alignment."""
+    tile_elems = (block_seq - 1) * (head_dim + smem_pad) + head_dim
+    tile_bytes = tile_elems * elem_bytes
+    # SmemAllocator aligns each allocation to 16 bytes
+    tile_bytes = (tile_bytes + 15) & ~15
+    return 2 * tile_bytes
+
+
 def select_num_splits(
     num_kv_heads: int,
     seq_len: int,
@@ -72,7 +81,20 @@ def select_num_splits(
 ) -> int:
     if num_kv_heads <= 0:
         raise ValueError("num_kv_heads must be positive")
-    min_splits = max(1, math.ceil(num_sms * target_blocks_per_sm / num_kv_heads))
+
+    # Compute SMEM-limited max concurrent blocks per SM.
+    # Subtract 1 from theoretical max — allocator overhead uses ~1-2 KB
+    # that the cosize calculation doesn't account for.
+    smem_per_block = _smem_bytes_per_block(block_seq, 128, SMEM_PAD)
+    smem_per_sm = 228 * 1024  # H100 SXM
+    max_blocks_per_sm = max(1, smem_per_sm // smem_per_block - 1)
+
+    # Fill one wave up to the SMEM ceiling
+    max_grid = num_sms * max_blocks_per_sm
+    target_grid = num_sms * max_blocks_per_sm  # aim for full SMEM occupancy
+
+    effective_grid = min(target_grid, max_grid)
+    min_splits = max(1, effective_grid // num_kv_heads)
     max_tiles = max(1, math.ceil(seq_len / block_seq))
     return min(min_splits, max_tiles)
 
