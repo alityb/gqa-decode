@@ -430,15 +430,17 @@ def reduce_partials(
 ) -> torch.Tensor:
     """Combine split-K partial results using online softmax correction."""
     out_dtype = partial_out.dtype
-    partial_out = partial_out.view(num_q_heads, num_splits, head_dim).float()
-    # Max/sum are broadcast across head_dim; extract column 0 for the scalar
-    partial_max = partial_max.view(num_q_heads, num_splits, head_dim)[:, :, 0]
-    partial_sum = partial_sum.view(num_q_heads, num_splits, head_dim)[:, :, 0]
+    # Max/sum are broadcast across head_dim; column 0 holds the scalar
+    partial_max = partial_max[:, 0].view(num_q_heads, num_splits)
+    partial_sum = partial_sum[:, 0].view(num_q_heads, num_splits)
 
     global_max = partial_max.max(dim=1, keepdim=True).values
-    correction = torch.exp(partial_max - global_max)
-    corrected_sum = (partial_sum * correction).sum(dim=1, keepdim=True)
-    corrected_out = (partial_out * correction.unsqueeze(-1)).sum(dim=1)
+    correction = torch.exp(partial_max - global_max)  # [q_heads, splits]
+    corrected_sum = (partial_sum * correction).sum(dim=1, keepdim=True)  # [q_heads, 1]
+
+    # Apply correction to output and sum in one pass
+    partial_out = partial_out.view(num_q_heads, num_splits, head_dim).float()
+    corrected_out = torch.einsum("qsd,qs->qd", partial_out, correction)
 
     return (corrected_out / corrected_sum).to(out_dtype)
 
@@ -486,6 +488,13 @@ def gqa_decode_attention(
         )
     else:
         actual_splits = num_splits
+
+    if actual_splits == 1:
+        # Fast path: direct output, no partial buffers or reduction needed
+        out = torch.empty_like(q)
+        compiled = _compile_decode(dtype, head_dim, group_size, config.block_seq, num_splits=1)
+        compiled(q, k_cache, v_cache, out)
+        return out
 
     total_partials = num_q_heads * actual_splits
     partial_out = torch.empty(total_partials, head_dim, dtype=q.dtype, device=q.device)
