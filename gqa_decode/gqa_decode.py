@@ -89,12 +89,10 @@ def select_num_splits(
     smem_per_sm = 228 * 1024  # H100 SXM
     max_blocks_per_sm = max(1, smem_per_sm // smem_per_block - 1)
 
-    # Fill one wave up to the SMEM ceiling
+    # Fill one wave up to the SMEM ceiling — exceeding this causes a
+    # multi-wave penalty that drops DRAM throughput by ~20 percentage points.
     max_grid = num_sms * max_blocks_per_sm
-    target_grid = num_sms * max_blocks_per_sm  # aim for full SMEM occupancy
-
-    effective_grid = min(target_grid, max_grid)
-    min_splits = max(1, effective_grid // num_kv_heads)
+    min_splits = max(1, max_grid // num_kv_heads)
     max_tiles = max(1, math.ceil(seq_len / block_seq))
     return min(min_splits, max_tiles)
 
