@@ -273,23 +273,51 @@ class SplitKDecodeKernel:
         k_head = mK[kv_head, None, None]
         v_head = mV[kv_head, None, None]
 
+        # Allocate SMEM for K/V tile staging
+        smem = cutlass.utils.SmemAllocator()
+        sK = smem.allocate_tensor(
+            self.dtype,
+            cute.make_ordered_layout((self.block_seq, self.head_dim), order=(1, 0)),
+            byte_alignment=16,
+        )
+        sV = smem.allocate_tensor(
+            self.dtype,
+            cute.make_ordered_layout((self.block_seq, self.head_dim), order=(1, 0)),
+            byte_alignment=16,
+        )
+
+        # Pre-partition SMEM as copy destination (reused across tiles)
+        tKsK = thr.partition_D(sK)
+        tVsV = thr.partition_D(sV)
+
         for local_tile_idx in cutlass.range(tiles_per_split, unroll=1):
             tile_idx = first_tile + local_tile_idx
             if tile_idx < total_tiles:
                 k_tile = cute.local_tile(k_head, (self.block_seq, self.head_dim), (tile_idx, 0))
                 v_tile = cute.local_tile(v_head, (self.block_seq, self.head_dim), (tile_idx, 0))
                 tile_start = tile_idx * self.block_seq
+
+                # Bulk async copy K and V tiles from global to SMEM
+                tKgK = thr.partition_S(k_tile)
+                tVgV = thr.partition_S(v_tile)
+                copy_utils.copy(tKgK, tKsK, is_async=True)
+                copy_utils.copy(tVgV, tVsV, is_async=True)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+
+                # Process rows from SMEM
                 for row in cutlass.range_constexpr(self.block_seq):
                     seq_idx = tile_start + row
                     if seq_idx < seq_len:
-                        k_row = cute.local_tile(k_tile, (1, self.head_dim), (row, 0))
-                        v_row = cute.local_tile(v_tile, (1, self.head_dim), (row, 0))
-                        tKgK = thr.partition_S(k_row)
-                        tVgV = thr.partition_S(v_row)
-                        tKr = cute.make_rmem_tensor_like(tKgK)
-                        tVr = cute.make_rmem_tensor_like(tVgV)
-                        cute.copy(tiled_in, tKgK, tKr)
-                        cute.copy(tiled_in, tVgV, tVr)
+                        sK_row = cute.local_tile(sK, (1, self.head_dim), (row, 0))
+                        sV_row = cute.local_tile(sV, (1, self.head_dim), (row, 0))
+                        tKsKr = thr.partition_S(sK_row)
+                        tVsVr = thr.partition_S(sV_row)
+                        tKr = cute.make_rmem_tensor_like(tKsKr)
+                        tVr = cute.make_rmem_tensor_like(tVsVr)
+                        cute.copy(tiled_in, tKsKr, tKr)
+                        cute.copy(tiled_in, tVsVr, tVr)
                         k_vec = tKr.load().to(Float32)
                         v_vec = tVr.load().to(Float32)
 
