@@ -78,7 +78,7 @@ def select_num_splits(
 
 
 class DirectDecodeKernel:
-    def __init__(self, dtype, head_dim: int, group_size: int, block_seq: int):
+    def __init__(self, dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int = 1):
         if head_dim not in (64, 128):
             raise ValueError(f"Unsupported head_dim={head_dim}; expected 64 or 128")
         if head_dim % cute.arch.WARP_SIZE != 0:
@@ -89,6 +89,7 @@ class DirectDecodeKernel:
         self.head_dim = head_dim
         self.group_size = group_size
         self.block_seq = block_seq
+        self.num_splits = num_splits
         self.vec = head_dim // cute.arch.WARP_SIZE
         self.scale = float(head_dim**-0.5)
 
@@ -103,7 +104,7 @@ class DirectDecodeKernel:
     ):
         tiled_in = copy_utils.tiled_copy_2d(self.dtype, 32, 32, self.vec)
         self.kernel(mQ, mK, mV, mO, tiled_in).launch(
-            grid=[mK.shape[0], 1, 1],
+            grid=[mK.shape[0], self.num_splits, 1],
             block=[32, 1, 1],
             stream=stream,
         )
@@ -118,7 +119,7 @@ class DirectDecodeKernel:
         tiled_in: cute.TiledCopy,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        kv_head, _, _ = cute.arch.block_idx()
+        kv_head, split_idx, _ = cute.arch.block_idx()
         thr = tiled_in.get_slice(tidx)
 
         q_tile = cute.local_tile(mQ, (self.group_size, self.head_dim), (kv_head, 0))
@@ -141,44 +142,48 @@ class DirectDecodeKernel:
             running_sum.append(0.0)
 
         seq_len = mK.shape[1]
-        num_tiles = cute.ceil_div(seq_len, self.block_seq)
+        total_tiles = cute.ceil_div(seq_len, self.block_seq)
+        tiles_per_split = cute.ceil_div(total_tiles, self.num_splits)
+        first_tile = split_idx * tiles_per_split
         k_head = mK[kv_head, None, None]
         v_head = mV[kv_head, None, None]
 
-        for tile_idx in cutlass.range(num_tiles, unroll=1):
-            k_tile = cute.local_tile(k_head, (self.block_seq, self.head_dim), (tile_idx, 0))
-            v_tile = cute.local_tile(v_head, (self.block_seq, self.head_dim), (tile_idx, 0))
-            tile_start = tile_idx * self.block_seq
-            for row in cutlass.range_constexpr(self.block_seq):
-                seq_idx = tile_start + row
-                if seq_idx < seq_len:
-                    k_row = cute.local_tile(k_tile, (1, self.head_dim), (row, 0))
-                    v_row = cute.local_tile(v_tile, (1, self.head_dim), (row, 0))
-                    tKgK = thr.partition_S(k_row)
-                    tVgV = thr.partition_S(v_row)
-                    tKr = cute.make_rmem_tensor_like(tKgK)
-                    tVr = cute.make_rmem_tensor_like(tVgV)
-                    cute.copy(tiled_in, tKgK, tKr)
-                    cute.copy(tiled_in, tVgV, tVr)
-                    k_vec = tKr.load().to(Float32)
-                    v_vec = tVr.load().to(Float32)
+        for local_tile_idx in cutlass.range(tiles_per_split, unroll=1):
+            tile_idx = first_tile + local_tile_idx
+            if tile_idx < total_tiles:
+                k_tile = cute.local_tile(k_head, (self.block_seq, self.head_dim), (tile_idx, 0))
+                v_tile = cute.local_tile(v_head, (self.block_seq, self.head_dim), (tile_idx, 0))
+                tile_start = tile_idx * self.block_seq
+                for row in cutlass.range_constexpr(self.block_seq):
+                    seq_idx = tile_start + row
+                    if seq_idx < seq_len:
+                        k_row = cute.local_tile(k_tile, (1, self.head_dim), (row, 0))
+                        v_row = cute.local_tile(v_tile, (1, self.head_dim), (row, 0))
+                        tKgK = thr.partition_S(k_row)
+                        tVgV = thr.partition_S(v_row)
+                        tKr = cute.make_rmem_tensor_like(tKgK)
+                        tVr = cute.make_rmem_tensor_like(tVgV)
+                        cute.copy(tiled_in, tKgK, tKr)
+                        cute.copy(tiled_in, tVgV, tVr)
+                        k_vec = tKr.load().to(Float32)
+                        v_vec = tVr.load().to(Float32)
 
-                    for h in cutlass.range_constexpr(self.group_size):
-                        score = (q_regs[h] * k_vec).reduce(
-                            cute.ReductionOp.ADD,
-                            init_val=0.0,
-                            reduction_profile=0,
-                        )
-                        score = cute.arch.warp_reduction(score, operator.add) * self.scale
-                        max_next = cute.arch.fmax(running_max[h], score)
-                        old_scale = cute.math.exp2(
-                            (running_max[h] - max_next) * LOG2_E,
-                            fastmath=True,
-                        )
-                        score_scale = cute.math.exp2((score - max_next) * LOG2_E, fastmath=True)
-                        running_max[h] = max_next
-                        running_sum[h] = running_sum[h] * old_scale + score_scale
-                        acc_regs[h] = acc_regs[h] * old_scale + v_vec * score_scale
+                        for h in cutlass.range_constexpr(self.group_size):
+                            score = (q_regs[h] * k_vec).reduce(
+                                cute.ReductionOp.ADD,
+                                init_val=0.0,
+                                reduction_profile=0,
+                            )
+                            score = cute.arch.warp_reduction(score, operator.add) * self.scale
+                            max_next = cute.arch.fmax(running_max[h], score)
+                            old_scale = cute.math.exp2(
+                                (running_max[h] - max_next) * LOG2_E,
+                                fastmath=True,
+                            )
+                            score_scale = cute.math.exp2((score - max_next) * LOG2_E, fastmath=True)
+                            running_max[h] = max_next
+                            running_sum[h] = running_sum[h] * old_scale + score_scale
+                            acc_regs[h] = acc_regs[h] * old_scale + v_vec * score_scale
 
         for h in cutlass.range_constexpr(self.group_size):
             out_row = cute.local_tile(o_tile, (1, self.head_dim), (h, 0))
@@ -190,7 +195,7 @@ class DirectDecodeKernel:
 
 
 @lru_cache(maxsize=None)
-def _compile_decode(dtype, head_dim: int, group_size: int, block_seq: int):
+def _compile_decode(dtype, head_dim: int, group_size: int, block_seq: int, num_splits: int = 1):
     q_heads = cute.sym_int()
     kv_heads = cute.sym_int()
     seq_len = cute.sym_int()
@@ -206,7 +211,7 @@ def _compile_decode(dtype, head_dim: int, group_size: int, block_seq: int):
         divisibility=16 // (dtype.width // 8),
     )
     o_cute = make_fake_tensor(dtype, (q_heads, head_dim), divisibility=16 // (dtype.width // 8))
-    kernel = DirectDecodeKernel(dtype, head_dim=head_dim, group_size=group_size, block_seq=block_seq)
+    kernel = DirectDecodeKernel(dtype, head_dim=head_dim, group_size=group_size, block_seq=block_seq, num_splits=num_splits)
     return cute.compile(
         kernel,
         q_cute,
