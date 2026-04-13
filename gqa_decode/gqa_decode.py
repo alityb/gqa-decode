@@ -448,12 +448,16 @@ def gqa_decode_attention(
         return reference_gqa_decode(q, k_cache, v_cache, num_kv_heads=num_kv_heads)
     if config is None:
         config = GQADecodeConfig()
-    if num_splits not in (None, 1):
-        raise NotImplementedError("multi-split not yet enabled (Step 3)")
-
     group_size = num_q_heads // num_kv_heads
     dtype = torch2cute_dtype_map[q.dtype]
-    actual_splits = 1
+    seq_len = k_cache.shape[1]
+
+    if num_splits is None:
+        actual_splits = select_num_splits(
+            num_kv_heads, seq_len, config.block_seq, config.target_blocks_per_sm,
+        )
+    else:
+        actual_splits = num_splits
 
     total_partials = num_q_heads * actual_splits
     partial_out = torch.empty(total_partials, head_dim, dtype=q.dtype, device=q.device)
