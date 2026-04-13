@@ -273,18 +273,14 @@ class SplitKDecodeKernel:
         k_head = mK[kv_head, None, None]
         v_head = mV[kv_head, None, None]
 
-        # Allocate SMEM for K/V tile staging
+        # Allocate SMEM for K/V tile staging with PAD to avoid bank conflicts
         smem = cutlass.utils.SmemAllocator()
-        sK = smem.allocate_tensor(
-            self.dtype,
-            cute.make_ordered_layout((self.block_seq, self.head_dim), order=(1, 0)),
-            byte_alignment=16,
+        smem_layout = cute.make_layout(
+            (self.block_seq, self.head_dim),
+            stride=(self.head_dim + SMEM_PAD, 1),
         )
-        sV = smem.allocate_tensor(
-            self.dtype,
-            cute.make_ordered_layout((self.block_seq, self.head_dim), order=(1, 0)),
-            byte_alignment=16,
-        )
+        sK = smem.allocate_tensor(self.dtype, smem_layout, byte_alignment=16)
+        sV = smem.allocate_tensor(self.dtype, smem_layout, byte_alignment=16)
 
         # Pre-partition SMEM as copy destination (reused across tiles)
         tKsK = thr.partition_D(sK)
